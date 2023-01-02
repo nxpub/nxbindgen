@@ -35,7 +35,7 @@ class PyGenerator:
 
     def __init__(
         self, *,
-        reduce_parentheses=False,
+        reduce_parentheses=True,
         use_type_hints=False,
         keep_empty_declarations=False,
         type_hint_declarations=False,
@@ -46,6 +46,7 @@ class PyGenerator:
         self._parent = None
         self._skip = set()
         self._indent_level = 0
+        self._sub_exprs = []
         self._use_type_hints = use_type_hints
         self._reduce_parentheses = reduce_parentheses
         self._keep_empty_decl = keep_empty_declarations
@@ -231,7 +232,8 @@ class PyGenerator:
         if isinstance(n, c_ast.InitList):
             return '[' + self.visit(n, parent=parent) + ']'  # '{' + self.visit(n) + '}'
         elif isinstance(n, c_ast.ExprList):
-            return '(' + self.visit(n, parent=parent) + ')'
+            # We store sub expressions in self._sub_exprs, TODO: when do we want to clear that list?
+            return self.visit(n, parent=parent)  # '(' + self.visit(n) + ')'
         else:
             return self.visit(n, parent=parent)
 
@@ -278,12 +280,15 @@ class PyGenerator:
         return self._parenthesize_unless_simple(n.expr, parent=n)
 
     def visit_ExprList(self, n):
-        visited_subexprs = []
+        # Python doesn't support expressions list, so we should unpack it
+        self._sub_exprs.clear()
         for expr in n.exprs:
-            visited_subexprs.append(self._visit_expr(expr, parent=n))
-        return ', '.join(visited_subexprs)
+            self._sub_exprs.append(self._visit_expr(expr, parent=n))
+        # TODO: We temporary return only the last expression, but save others in the state
+        return self._sub_exprs[-1]
 
     def visit_InitList(self, n):
+        # TODO: I don't thin this case is solved, verify!
         visited_subexprs = []
         for expr in n.exprs:
             visited_subexprs.append(self._visit_expr(expr, parent=n))
@@ -368,6 +373,10 @@ class PyGenerator:
         return 'pass'  # ';'
 
     def visit_ParamList(self, n):
+        # Special case for a single void
+        if len(n.params) == 1 and (param := n.params[0]).name is None:
+            # TODO: Should we check for void type in particular?
+            return ''
         return ', '.join(self.visit(param, parent=n) for param in n.params)
 
     def visit_Return(self, n):
@@ -400,6 +409,16 @@ class PyGenerator:
         return s
 
     def visit_If(self, n):
+        # Check for special cases (if 1, if 0) when if should be reduced
+        if isinstance(n.cond, c_ast.Constant) and n.cond.type == 'int':
+            if n.cond.value == '1':
+                return self.visit(n.iftrue, parent=n) + '\n'
+            elif n.cond.value == '0':
+                if n.iffalse:
+                    return self.visit(n.iffalse, parent=n) + '\n'
+                return ''
+
+        # Regular if processing
         s = 'if '
         if n.cond:
             cond_str = self.visit(n.cond, parent=n)
@@ -642,7 +661,7 @@ class PyGenerator:
 
     def visit_Label(self, n):
         # TODO: We don't support labels, so some handler/trigger should be activated here
-        return n.name + ':\n' + self._generate_stmt(n.stmt, parent=n)
+        return f'# TODO: label={n.name}\n' + self._nstrip(self._generate_stmt(n.stmt, parent=n))
 
     def visit_Goto(self, n):
         # TODO: We don't support gotos, use handler/trigger instead
@@ -856,13 +875,19 @@ class PyGenerator:
 
     def _parenthesize_unless_simple(self, n, *, parent):
         """ Common use case for _parenthesize_if """
-        return self._parenthesize_if(n, parent=parent, condition=lambda _: False)  # lambda d: not self._is_simple_node(d)
+        return self._parenthesize_if(n, parent=parent, condition=lambda d: not self._is_simple_node(d))  # lambda _: False
 
     def _is_simple_node(self, n):
         """ Returns True for nodes that are "simple" - i.e. nodes that always
         have higher precedence than operators. """
+        # Check for python related reduced cases
+        if (
+            isinstance(n, c_ast.Cast) or
+            (isinstance(n, c_ast.UnaryOp) and n.op in ('&', '*'))
+        ):
+            return True
         return isinstance(n, (c_ast.Constant, c_ast.ID, c_ast.ArrayRef,
-                              c_ast.StructRef, c_ast.FuncCall))
+                              c_ast.StructRef, c_ast.FuncCall))  # Cast is reduced, so it's simple now
 
     def _is_single_node(self, n):
         # TODO: More cases here + invert the check, there are not so many complex nodes (compound, etc)
