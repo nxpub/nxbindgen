@@ -9,7 +9,7 @@ import re
 import contextlib
 
 from enum import IntFlag, auto
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 
 from pycparser import c_ast
 
@@ -62,8 +62,8 @@ class PyGenerator:
         if cond:
             self._indent_level -= 1
 
-    def _make_indent(self):
-        return self.DEFAULT_INDENT * self._indent_level
+    def _make_indent(self, extra: int = 0):
+        return self.DEFAULT_INDENT * (self._indent_level + extra)
 
     def visit(
         self, node, *,
@@ -138,10 +138,10 @@ class PyGenerator:
         else:
             operand = self._parenthesize_unless_simple(n.expr, parent=n)
             # TODO: We need to detect cases when we can't do this
-            if n.op == 'p++':
+            if n.op in ('p++', '++'):
                 # return '%s++' % operand
                 return f'{operand} += 1'
-            elif n.op == 'p--':
+            elif n.op in ('p--', '--'):
                 # return '%s--' % operand
                 return f'{operand} -= 1'
             else:
@@ -375,9 +375,15 @@ class PyGenerator:
         # s += '(' + self._visit_expr(n.iftrue) + ') : '
         # s += '(' + self._visit_expr(n.iffalse) + ')'
         if_true_str = self._visit_expr(n.iftrue, parent=n)
+        if not self._is_single_node(n.iftrue):
+            if_true_str = f'({if_true_str})'
         cond_str = self._visit_expr(n.cond, parent=n)
+        if not self._is_single_node(n.cond):
+            cond_str = f'({cond_str})'
         if_false_str = self._visit_expr(n.iffalse, parent=n)
-        s = f'({if_true_str}) if ({cond_str}) else ({if_false_str})'
+        if not self._is_single_node(n.iffalse):
+            if_false_str = f'({if_false_str})'
+        s = f'{if_true_str} if {cond_str} else {if_false_str}'
         return s
 
     def visit_If(self, n):
@@ -388,7 +394,6 @@ class PyGenerator:
                 cond_str = f'({cond_str})'
         else:
             cond_str = '()'
-            raise NotImplementedError()
         s += cond_str + ':\n'
         s += self._generate_stmt(n.iftrue, parent=n, add_indent=True)
         # TODO: There's a problem w/ indents in nested ifs, original c/py mix
@@ -448,7 +453,7 @@ class PyGenerator:
         s = ''
         if range_str := self._convert_to_range(n):
             s += f'{range_str}\n'
-            s += self._generate_stmt(n.stmt, parent=n, add_indent=True)
+            s += self._generate_stmt(n.stmt, parent=n, add_indent=True)[:-1]  # TODO: Drops \n, otherwise we have x2
         else:
             # Default fallback to while-loop
             if n.init:
@@ -466,12 +471,49 @@ class PyGenerator:
             self._indent_level = indent
         return s
 
+    def _extract_effects(
+        self, n: c_ast.Node
+    ) -> Tuple[Optional[c_ast.Node], Optional[c_ast.Node], Optional[c_ast.Node]]:
+        # TODO: More cases, recursive check and so on
+        if isinstance(n, c_ast.UnaryOp):
+            if n.op in ('p++', 'p--'):
+                return None, n, n.expr
+            elif n.op in ('--', '++'):
+                return n, n, n.expr
+            else:
+                raise NotImplementedError
+        if isinstance(n, c_ast.BinaryOp):
+            (l_pre, l_post, l_expr) = self._extract_effects(n.left)
+            (r_pre, r_post, r_expr) = self._extract_effects(n.right)
+            pre = list(filter(None, [l_pre, r_pre])) or [None]
+            post = list(filter(None, [l_post, r_post])) or [None]
+            return (
+                c_ast.Compound(block_items=pre) if len(pre) > 1 else pre[0],
+                c_ast.Compound(block_items=post) if len(post) > 1 else post[0],
+                c_ast.BinaryOp(n.op, l_expr, r_expr)
+            )
+        if self._is_simple_node(n):
+            return None, None, n
+        raise NotImplementedError
+
     def visit_While(self, n):
-        s = 'while ('
-        if n.cond:
-            s += self.visit(n.cond, parent=n)
-        s += '):\n'
+        s = ''
+        pre, post, cond = self._extract_effects(n.cond)
+        if pre:
+            print('pre-effect:', ' '.join(map(lambda x: x.strip(), str(pre).splitlines())))
+            s += self.visit(pre, parent=n) + '\n' + self._make_indent()
+        s += 'while '
+        if cond:
+            cond_str = self.visit(cond, parent=n)
+            if not self._is_single_node(cond):
+                cond_str = f'({cond_str})'
+        else:
+            cond_str = '()'
+        s += cond_str + ':\n'
         s += self._generate_stmt(n.stmt, parent=n, add_indent=True)
+        if post:
+            print('post-effect:', ' '.join(map(lambda x: x.strip(), str(post).splitlines())))
+            s += self._make_indent(1) + self.visit(post, parent=n)
         return s
 
     def visit_DoWhile(self, n):
@@ -676,8 +718,9 @@ class PyGenerator:
             # function syntax.
             for i, modifier in enumerate(modifiers):
                 if isinstance(modifier, c_ast.ArrayDecl):
-                    if i != 0 and isinstance(modifiers[i - 1], c_ast.PtrDecl):
-                        nstr = '(' + nstr + ')'
+                    # We don't need to wrap stuff at all, TODO: Revisit
+                    # if i != 0 and isinstance(modifiers[i - 1], c_ast.PtrDecl):
+                    #     nstr = '(' + nstr + ')'
                     # TODO: Remove, check dim processing
                     # nstr += '['
                     # if modifier.dim_quals:
@@ -685,9 +728,9 @@ class PyGenerator:
                     # nstr += self.visit(modifier.dim, parent=n) + ']'
                     s = f'List[{self._map_type(s)}]'
                 elif isinstance(modifier, c_ast.FuncDecl):
-                    if i != 0 and isinstance(modifiers[i - 1], c_ast.PtrDecl):
-                        # TODO: Check, looks like we can skip/reduce this
-                        nstr = '(' + nstr + ')'
+                    # We don't need to wrap stuff at all, TODO: Revisit
+                    # if i != 0 and isinstance(modifiers[i - 1], c_ast.PtrDecl):
+                    #     nstr = '(' + nstr + ')'
                     nstr += '(' + self.visit(modifier.args, parent=parent, flag=Context.FuncArgs) + ')'
                 elif isinstance(modifier, c_ast.PtrDecl):
                     # TODO: We don't support quals (like 'const'), skipped
@@ -734,7 +777,7 @@ class PyGenerator:
 
     def _parenthesize_unless_simple(self, n, *, parent):
         """ Common use case for _parenthesize_if """
-        return self._parenthesize_if(n, parent=parent, condition=lambda d: not self._is_simple_node(d))
+        return self._parenthesize_if(n, parent=parent, condition=lambda _: False)  # lambda d: not self._is_simple_node(d)
 
     def _is_simple_node(self, n):
         """ Returns True for nodes that are "simple" - i.e. nodes that always
@@ -743,4 +786,7 @@ class PyGenerator:
                               c_ast.StructRef, c_ast.FuncCall))
 
     def _is_single_node(self, n):
-        return isinstance(n, (c_ast.BinaryOp, c_ast.UnaryOp, c_ast.FuncCall, c_ast.Constant, c_ast.ID))
+        # TODO: More cases here + invert the check, there are not so many complex nodes (compound, etc)
+        return isinstance(n, (
+            c_ast.BinaryOp, c_ast.UnaryOp, c_ast.FuncCall, c_ast.Constant, c_ast.ID, c_ast.Cast, c_ast.StructRef
+        ))
