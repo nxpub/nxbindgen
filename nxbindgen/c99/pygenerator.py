@@ -67,7 +67,7 @@ class PyGenerator:
 
     def visit(
         self, node, *,
-        parent: Optional[c_ast.Node] = None,
+        parent: Optional[c_ast.Node],
         flag: Optional[Context] = None,
         **kwargs
     ):
@@ -321,11 +321,13 @@ class PyGenerator:
             # TODO: Add some class-level filter, too hardcoded now
             elif isinstance(ext, (c_ast.Typedef, c_ast.Struct)):
                 # Let's ignore for now
-                print('ignoring:', ext.name)
+                # print('ignoring:', ext.name)
+                pass
             else:
                 if isinstance(ext.type, (c_ast.FuncDecl, c_ast.Struct)):
                     # Typedef, Struct, TypeDecl, FuncDecl
-                    print('ignoring:', ext.name)
+                    # print('ignoring:', ext.name)
+                    pass
                 else:
                     s += self.visit(ext, parent=n) + '\n\n\n'  # ';\n'
         return s
@@ -379,15 +381,24 @@ class PyGenerator:
         return s
 
     def visit_If(self, n):
-        s = 'if ('
+        s = 'if '
         if n.cond:
-            s += self.visit(n.cond, parent=n)
-        s += '):\n'
+            cond_str = self.visit(n.cond, parent=n)
+            if not self._is_single_node(n.cond):
+                cond_str = f'({cond_str})'
+        else:
+            cond_str = '()'
+            raise NotImplementedError()
+        s += cond_str + ':\n'
         s += self._generate_stmt(n.iftrue, parent=n, add_indent=True)
         # TODO: There's a problem w/ indents in nested ifs, original c/py mix
         if n.iffalse:
-            s += self._make_indent() + 'else:\n'
-            s += self._generate_stmt(n.iffalse, parent=n, add_indent=True)
+            # Special case for elif instead else if
+            if isinstance(n.iffalse, c_ast.If):
+                s += self._make_indent() + 'el' + self._generate_stmt(n.iffalse, parent=n, add_indent=True).lstrip()
+            else:
+                s += self._make_indent() + 'else:\n'
+                s += self._generate_stmt(n.iffalse, parent=n, add_indent=True)
         return s
 
     def _convert_to_range(self, n: c_ast.For) -> Optional[str]:
@@ -396,14 +407,21 @@ class PyGenerator:
         #  - isinstance(n.init, c_ast.Assignment)
         #  - isinstance(n.cond, c_ast.BinaryOp)
         #  - n.next.expr == n.init.lvalue == n.cond.left
+        init_decl = False
         if (
-            isinstance(n.init, c_ast.Assignment) and  # isinstance(n.init.rvalue, c_ast.Constant) and
+            (
+                isinstance(n.init, c_ast.Assignment) or
+                (init_decl := (isinstance(n.init, c_ast.DeclList) and (len(n.init.decls) == 1)))
+            ) and  # isinstance(n.init.rvalue, c_ast.Constant) and
             isinstance(n.next, c_ast.UnaryOp) and n.next.op in ('p++', '++p', 'p--', '--p', '++', '--') and
             isinstance(n.cond, c_ast.BinaryOp) and  # isinstance(n.cond.right, c_ast.Constant) and
-            (var_name := n.next.expr.name) == n.init.lvalue.name == n.cond.left.name
+            (var_name := n.next.expr.name) == (n.init.decls[0].name if init_decl else n.init.lvalue.name) == n.cond.left.name
         ):
             # TODO: Better direction checks, step control and so on
-            init_str = self.visit(n.init.rvalue, parent=n.init)
+            if init_decl:
+                init_str = self.visit(n.init.decls[0].init, parent=n.init)  # TODO: or parent=n.init.decls[0]?
+            else:
+                init_str = self.visit(n.init.rvalue, parent=n.init)
             cond_str = self.visit(n.cond.right, parent=n.cond)
             step = -1 if '--' in n.next.op else +1
             if n.cond.op in ('>=', '<='):
@@ -484,7 +502,7 @@ class PyGenerator:
 
     def visit_Switch(self, n):
         # TODO: Probably the best tactic would be to use ifs instead of match
-        s = 'match (' + self.visit(n.cond, parent=n) + ')\n'
+        s = 'match (' + self.visit(n.cond, parent=n) + '):\n'
         s += self._generate_stmt(n.stmt, parent=n, add_indent=True)
         return s
 
@@ -507,7 +525,7 @@ class PyGenerator:
 
     def visit_Goto(self, n):
         # TODO: We don't support gotos, use handler/trigger instead
-        return f'goto {n.name}'
+        return f'goto_{n.name}()'
 
     def visit_EllipsisParam(self, n):
         return '...'
@@ -723,3 +741,6 @@ class PyGenerator:
         have higher precedence than operators. """
         return isinstance(n, (c_ast.Constant, c_ast.ID, c_ast.ArrayRef,
                               c_ast.StructRef, c_ast.FuncCall))
+
+    def _is_single_node(self, n):
+        return isinstance(n, (c_ast.BinaryOp, c_ast.UnaryOp, c_ast.FuncCall, c_ast.Constant, c_ast.ID))
