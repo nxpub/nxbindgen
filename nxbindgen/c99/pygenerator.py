@@ -44,6 +44,7 @@ class PyGenerator:
         # the _make_indent method.
         self._state = 0
         self._parent = None
+        self._skip = set()
         self._indent_level = 0
         self._use_type_hints = use_type_hints
         self._reduce_parentheses = reduce_parentheses
@@ -62,6 +63,14 @@ class PyGenerator:
         if cond:
             self._indent_level -= 1
 
+    @contextlib.contextmanager
+    def skip(self, *names):
+        for name in names:
+            self._skip.add(name)
+        yield
+        for name in names:
+            self._skip.remove(name)
+
     def _make_indent(self, extra: int = 0):
         return self.DEFAULT_INDENT * (self._indent_level + extra)
 
@@ -71,7 +80,10 @@ class PyGenerator:
         flag: Optional[Context] = None,
         **kwargs
     ):
-        method = 'visit_' + node.__class__.__name__
+        cls_name = node.__class__.__name__
+        if cls_name in self._skip:
+            return ''
+        method = f'visit_{cls_name}'
         if flag:
             self._state |= flag
         prev_parent, self._parent = self._parent, parent
@@ -374,6 +386,7 @@ class PyGenerator:
         # s = '(' + self._visit_expr(n.cond) + ') ? '
         # s += '(' + self._visit_expr(n.iftrue) + ') : '
         # s += '(' + self._visit_expr(n.iffalse) + ')'
+        # TODO: Use parenthesize_if, please
         if_true_str = self._visit_expr(n.iftrue, parent=n)
         if not self._is_single_node(n.iftrue):
             if_true_str = f'({if_true_str})'
@@ -406,7 +419,7 @@ class PyGenerator:
                 s += self._generate_stmt(n.iffalse, parent=n, add_indent=True)
         return s
 
-    def _convert_to_range(self, n: c_ast.For) -> Optional[str]:
+    def _for_to_range(self, n: c_ast.For) -> Optional[str]:
         # To convert for-loop to range we need to make sure that
         #  - isinstance(n.next, c_ast.UnaryOp)
         #  - isinstance(n.init, c_ast.Assignment)
@@ -451,7 +464,7 @@ class PyGenerator:
         # s += ')\n'
         # s += self._generate_stmt(n.stmt, add_indent=True)
         s = ''
-        if range_str := self._convert_to_range(n):
+        if range_str := self._for_to_range(n):
             s += f'{range_str}\n'
             s += self._generate_stmt(n.stmt, parent=n, add_indent=True)[:-1]  # TODO: Drops \n, otherwise we have x2
         else:
@@ -461,6 +474,7 @@ class PyGenerator:
             indent = self._indent_level
             s += self._make_indent() + 'while True:\n'
             s += self._generate_stmt(n.stmt, parent=n, add_indent=True)
+            # TODO: Awful indent level calculation here, refactor asap
             self._indent_level += 1
             if n.next:
                 s += self._make_indent() + self.visit(n.next, parent=n) + '\n'
@@ -542,10 +556,75 @@ class PyGenerator:
         s += ')'
         return s
 
+    def _has_fallthrough(self, n: c_ast.Switch) -> bool:
+        for stmt in n.stmt:
+            if isinstance(stmt, c_ast.Case):
+                has_break = False
+                for sub in stmt.stmts:
+                    if isinstance(sub, c_ast.Break):
+                        has_break = True
+                    elif has_break:
+                        # TODO: We can support this case, eliminating the unreachable code
+                        # TODO: We also don't check for conditional breaks, which is a separate deal
+                        raise NotImplementedError('Code after non-conditional break')
+                if not has_break:
+                    return True
+            elif isinstance(stmt, c_ast.Default):
+                pass
+            else:
+                raise NotImplementedError
+        return False
+
+    @staticmethod
+    def _nstrip(value: str) -> str:
+        return '\n'.join(filter(None, map(lambda x: '' if not x.strip() else x, value.split('\n'))))
+
+    def _switch_to_ifs(self, n: c_ast.Switch) -> str:
+        # TODO: Check for conditional breaks also
+        s, idx, shared, blocks = '', 0, [], []
+        # We need a temp variable if it's not a constant
+        if not isinstance(n.cond, (c_ast.ID, c_ast.Constant)):
+            # TODO: init = c_ast.Assignment('=', c_ast...)?
+            raise NotImplementedError
+        for stmt in n.stmt:
+            if isinstance(stmt, c_ast.Case):
+                blocks.append((c_ast.BinaryOp('==', n.cond, stmt.expr), idx))
+                has_break = False
+                for sub in stmt.stmts:
+                    if isinstance(sub, c_ast.Break):
+                        has_break = True
+                        for idx, (cond, offset) in enumerate(blocks):
+                            if idx == 0:
+                                s += f'if {self.visit(cond, parent=stmt)}:\n'
+                            else:
+                                # TODO: What's going on w/ indents? It's a mess, really
+                                s += self._make_indent() + f'elif {self.visit(cond, parent=stmt)}:\n'
+                            s += self.visit(c_ast.Compound(shared[offset:]), parent=n)
+                        blocks.clear()
+                    elif has_break:
+                        raise NotImplementedError
+                    else:
+                        shared.append(sub)
+                        idx += 1
+            elif isinstance(stmt, c_ast.Default):
+                with self.skip('Break'):
+                    s += self._make_indent() + 'else:\n' + self.visit(c_ast.Compound(stmt.stmts), parent=n)
+            else:
+                raise NotImplementedError
+        return s
+
     def visit_Switch(self, n):
-        # TODO: Probably the best tactic would be to use ifs instead of match
-        s = 'match (' + self.visit(n.cond, parent=n) + '):\n'
-        s += self._generate_stmt(n.stmt, parent=n, add_indent=True)
+        # We can render python's match stmt only if not fallthrough
+        if not self._has_fallthrough(n):
+            # TODO: Use parenthesize_if, please
+            cond_str = self.visit(n.cond, parent=n)
+            if not self._is_single_node(n.cond):
+                cond_str = f'({cond_str})'
+            s = f'match {cond_str}:\n'
+            with self.skip('Break'):
+                s += self._nstrip(self._generate_stmt(n.stmt, parent=n, add_indent=True))
+        else:
+            s = self._nstrip(self._switch_to_ifs(n))
         return s
 
     def visit_Case(self, n):
@@ -567,7 +646,7 @@ class PyGenerator:
 
     def visit_Goto(self, n):
         # TODO: We don't support gotos, use handler/trigger instead
-        return f'goto_{n.name}()'
+        return f'env.goto_{n.name}()'
 
     def visit_EllipsisParam(self, n):
         return '...'
