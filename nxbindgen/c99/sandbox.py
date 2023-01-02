@@ -7,17 +7,19 @@ from typing import List, Optional
 from pycparser.c_parser import CParser
 from pycparser.c_generator import CGenerator
 
-from nxbindgen.c99 import PyGenerator
+from nxbindgen.c99 import PyGenerator, config
 
-ROOT_PATH = Path(__file__).parent
-CPYTHON_PATH = (Path(__file__).parent / '../build/cpython/').resolve()
+BINARYEN_PATH = Path('/home/nxpub/dev/nxbinaryen/binaryen/')
+CPYTHON_PATH = Path('/home/nxpub/dev/nxpython/build/cpython/')
+OUTPUT_PATH = Path('/home/nxpub/dev/nxbindgen/build/')
 
 
 def preprocess(c_path: Path, *, keep_comments: bool = False, cpp_args: Optional[List[str]] = None) -> str:
     lines = []
+    run_line = ['cpp', '-nostdinc', '-E', '-P', *(cpp_args or []), str(c_path)] + (['-CC'] if keep_comments else [])
+    print(' '.join(run_line))
     for line in map(lambda x: x.strip(), subprocess.Popen(
-        ['cpp', '-nostdinc', '-E', '-P', *(cpp_args or []), str(c_path)] + (['-CC'] if keep_comments else []),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE  # subprocess.DEVNULL
+        run_line, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     ).stdout.read().decode('utf-8').splitlines()):
         lines.append(line)
     return '\n'.join(lines)
@@ -27,34 +29,51 @@ def remove_comments(cdef: str) -> str:
     raise NotImplementedError
 
 
-def apply_fixes(fp, header_path: Path) -> None:
-    # https://github.com/eliben/pycparser/wiki/FAQ#what-do-i-do-about-__attribute__
-    fp.write('#define __attribute__(x)\n')
-    fp.write('#define __typeof__(x)\n')
-    # https://github.com/eliben/pycparser/issues/430, https://github.com/eliben/pycparser/issues/476
-    fp.write('#define _Atomic(x) x\n')
-    with open(header_path) as h_file:
-        for idx, line in enumerate(lines := h_file.readlines()):
-            clean = line.strip()
-            if not clean:
-                fp.write('//\n')
-            else:
-                # https://github.com/eliben/pycparser/issues/484
-                if clean.endswith(':') and lines[idx + 1].strip() == '}':
-                    line = f'{line};'
-                fp.write(line)
-    fp.flush()
-
-
 class PythonConverter:
 
-    def __init__(self, *, imports: Optional[List[str]] = None) -> None:
+    def __init__(
+        self, *,
+        imports: Optional[List[str]] = None,
+        includes: Optional[List[str]] = None,
+        defines: Optional[dict] = None,
+    ) -> None:
         self._ast = None
         self._imports = imports or []
+        self._defines = defines or {}
+        self._includes = includes or []
 
-    def load_c(self, path: Path, flags: List[str], includes: List[Path]) -> None:
-        with tempfile.NamedTemporaryFile('w+', dir=ROOT_PATH) as temp_file:
-            apply_fixes(temp_file, path)
+    def apply_fixes(self, fp, header_path: Path) -> None:
+        for macro_src, macro_dst in {
+            # https://github.com/eliben/pycparser/wiki/FAQ#what-do-i-do-about-__attribute__
+            '__attribute__(x)': '',
+            '__typeof__(x)': '',
+            # https://github.com/eliben/pycparser/issues/430, https://github.com/eliben/pycparser/issues/476
+            '_Atomic(x)': 'x',
+        }.items():
+            fp.write(f'#define {macro_src} {macro_dst}'.strip() + '\n')
+        for include_name in self._includes:
+            fp.write(f'#include "{include_name}"\n')
+        for macro_src, macro_dst in self._defines.items():
+            fp.write(f'#define {macro_src} {macro_dst}'.strip() + '\n')
+        with open(header_path) as h_file:
+            for idx, line in enumerate(lines := h_file.readlines()):
+                clean = line.strip()
+                if not clean:
+                    fp.write('//\n')
+                else:
+                    # https://github.com/eliben/pycparser/issues/484
+                    if clean.endswith(':') and lines[idx + 1].strip() == '}':
+                        line = f'{line};'
+                    fp.write(line)
+        fp.flush()
+
+    def load_c(
+        self, path: Path,
+        flags: List[str],
+        includes: List[Path],
+    ) -> None:
+        with tempfile.NamedTemporaryFile('w+', dir=path.parent) as temp_file:
+            self.apply_fixes(temp_file, path)
             processed = preprocess(Path(temp_file.name), cpp_args=[
                 *map(lambda f: f'-D{f}', flags),
                 *map(lambda p: f'-I{p}', includes)
@@ -63,13 +82,18 @@ class PythonConverter:
         self._ast = CParser().parse(processed, filename=str(path))
 
     def render_py(self, path: Path) -> None:
-        generator = PyGenerator(keep_empty_declarations=True, type_hint_declarations=False)
+        generator = PyGenerator(keep_empty_declarations=False, type_hint_declarations=False)
         with open(path, 'w') as py_file:
             if self._imports:
                 for imp in self._imports:
                     py_file.write(imp + '\n')
                 py_file.write('\n\n')
-            py_file.write(generator.visit(self._ast))
+            started = False
+            for line in generator.visit(self._ast, parent=None).splitlines():
+                if line.startswith('def op_NOP('):
+                    started = True
+                if started:
+                    py_file.write(line + '\n')
 
     def render_c(self, path: Path) -> None:
         generator = CGenerator()
@@ -80,25 +104,27 @@ class PythonConverter:
 if __name__ == '__main__':
     bc = PythonConverter(
         imports=[
-            'from nxbinaryen.capi import *',
-            'from tests.utils import *',
-        ]
+            # 'from nxbinaryen.capi import *',
+            # 'from tests.utils import *',
+        ],
+        includes=config.INCLUDES,
+        defines=config.DEFINES,
     )
     bc.load_c(
-        # CPYTHON_PATH / 'Python/bytecodes.c',
-        Path('/home/nxpub/dev/nxbinaryen/binaryen/test/example/c-api-kitchen-sink.c'),
+        CPYTHON_PATH / 'Python/generated_cases.c.h',
+        # BINARYEN_PATH / 'test/example/c-api-kitchen-sink.c',
         flags=[
             'Py_BUILD_CORE=1',
         ],
         includes=[
-            ROOT_PATH / 'fake_libc_include',
-            Path('/home/nxpub/dev/nxbinaryen/binaryen/src'),
-            # CPYTHON_PATH / 'Include',
-            # CPYTHON_PATH / 'Include/internal',
-            # CPYTHON_PATH / 'builddir/wasi',
+            Path('./fake_libc_include').resolve(),
+            # BINARYEN_PATH / 'src',
+            CPYTHON_PATH / 'Include',
+            CPYTHON_PATH / 'Include/internal',
+            CPYTHON_PATH / 'builddir/wasi',
         ]
     )
-    # bc.render_c('/home/nxpub/dev/nxbuilder/cases_generator/bytecodes.gen.c')
-    # bc.render_py('/home/nxpub/dev/nxbuilder/cases_generator/bytecodes.gen.py')
-    bc.render_c('/home/nxpub/dev/nxbinaryen/tests/test_kitchen_sink.gen.c')
-    bc.render_py('/home/nxpub/dev/nxbinaryen/tests/test_kitchen_sink.gen.py')
+    # bc.render_c(OUTPUT_PATH / 'test_kitchen_sink.c')
+    # bc.render_py(OUTPUT_PATH / 'test_kitchen_sink.py')
+    bc.render_c(OUTPUT_PATH / 'generated_cases.c.h')
+    bc.render_py(OUTPUT_PATH / 'generated_cases.py')
