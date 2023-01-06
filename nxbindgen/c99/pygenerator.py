@@ -46,7 +46,6 @@ class PyGenerator:
         self._parent = None
         self._skip = set()
         self._indent_level = 0
-        self._sub_exprs = []
         self._use_type_hints = use_type_hints
         self._reduce_parentheses = reduce_parentheses
         self._keep_empty_decl = keep_empty_declarations
@@ -281,13 +280,13 @@ class PyGenerator:
 
     def visit_ExprList(self, n):
         # Python doesn't support expressions list, so we should unpack it
-        self._sub_exprs.clear()
+        visited_subexprs = []
         for expr in n.exprs:
-            self._sub_exprs.append(self._visit_expr(expr, parent=n))
-        # TODO: We temporary return only the last expression, but save others in the state
+            visited_subexprs.append(self._visit_expr(expr, parent=n))
         if isinstance(self._parent, c_ast.FuncCall):
-            return ', '.join(self._sub_exprs)
-        return self._sub_exprs[-1]
+            return ', '.join(visited_subexprs)
+        # TODO: We temporary return only the last expression
+        return visited_subexprs[-1]
 
     def visit_InitList(self, n):
         # TODO: I don't thin this case is solved, verify!
