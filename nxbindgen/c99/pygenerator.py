@@ -285,6 +285,8 @@ class PyGenerator:
         for expr in n.exprs:
             self._sub_exprs.append(self._visit_expr(expr, parent=n))
         # TODO: We temporary return only the last expression, but save others in the state
+        if isinstance(self._parent, c_ast.FuncCall):
+            return ', '.join(self._sub_exprs)
         return self._sub_exprs[-1]
 
     def visit_InitList(self, n):
