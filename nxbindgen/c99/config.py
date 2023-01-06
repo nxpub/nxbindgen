@@ -5,15 +5,17 @@ INCLUDES = [
     'pycore_ceval.h',         # _PyEval_SignalAsyncExc()
     'pycore_code.h',
     'pycore_function.h',
+    'pycore_initconfig.h',    # _PyStatus_OK() [3.11]
     'pycore_long.h',          # _PyLong_GetZero()
     'pycore_object.h',        # _PyObject_GC_TRACK()
     'pycore_moduleobject.h',  # PyModuleObject
     'pycore_opcode.h',        # EXTRA_CASES
     'pycore_pyerrors.h',      # _PyErr_Fetch()
+    'pycore_pylifecycle.h',   # _PyErr_Print() [3.11]
     'pycore_pymem.h',         # _PyMem_IsPtrFreed()
     'pycore_pystate.h',       # _PyInterpreterState_GET()
-    'pycore_range.h',         # _PyRangeIterObject
-    'pycore_sliceobject.h',   # _PyBuildSlice_ConsumeRefs
+    # 'pycore_range.h',         # _PyRangeIterObject [3.12]
+    # 'pycore_sliceobject.h',   # _PyBuildSlice_ConsumeRefs [3.12]
     'pycore_sysmodule.h',     # _PySys_Audit()
     'pycore_tuple.h',         # _PyTuple_ITEMS()
     'pycore_emscripten_signal.h',  # _Py_CHECK_EMSCRIPTEN_SIGNALS
@@ -33,6 +35,7 @@ DEFINES = {
     'PEEK(n)': '(env.stack.peek(n))',
     'POKE(n, v)': '(env.stack.poke(n, v))',
     'PUSH(val)': '(env.stack.push(val))',
+    'BASIC_PUSH(val)': '(env.stack.push(val))',
     'POP()': '(env.stack.pop())',
     'TOP()': '(env.stack.top())',
     'SECOND()': '(env.stack.second())',
@@ -49,7 +52,10 @@ DEFINES = {
     'ERROR_IF(cond, labelname)': '(env.flow.error_if(cond, #labelname))',
     'JUMPBY(offset)': '(env.flow.jumpby(offset))',
     'NEXTOPARG()': '(env.flow.next_oparg())',
-    'GO_TO_INSTRUCTION(instname)': '(env.flow.go_to_inst(instname))',
+    'GO_TO_INSTRUCTION(instname)': '(env.flow.go_to_inst(#instname))',
+    'JUMP_TO_INSTRUCTION(instname)': '(env.flow.go_to_inst(#instname))',
+    'DECREMENT_ADAPTIVE_COUNTER(val)': '(env.flow.dec_ac(val))',
+    'ADAPTIVE_COUNTER_IS_ZERO(val)': '(env.flow.is_ac_zero(val))',
     'DISPATCH_SAME_OPARG()': '(env.flow.dispatch_same_oparg())',
     'TRACE_FUNCTION_EXIT()': '(env.flow.trace_function_exit())',
     'DTRACE_FUNCTION_EXIT()': '(env.flow.dtrace_function_exit())',
@@ -60,9 +66,11 @@ DEFINES = {
     'PRE_DISPATCH_GOTO()': '(env.flow.pre_dispatch_goto())',
     'DISPATCH_GOTO()': '(env.flow.dispatch_goto())',
     'DISPATCH_INLINED': '(env.flow.dispatch_inlined())',
+    'Py_UNREACHABLE()': '(env.flow.unreachable())',
     # Memory related
     'Py_INCREF(val)': '(env.memory.inc_ref(val))',
     'Py_DECREF(val)': '(env.memory.dec_ref(val))',
+    'Py_XDECREF(val)': '(env.memory.dec_ref(val))',
     'Py_SETREF(dst, src)': '(env.memory.set_ref(dst, src))',
     'Py_XSETREF(dst, src)': '(env.memory.set_ref(dst, src))',
     'Py_CLEAR(op)': '(env.memory.clear(op))',

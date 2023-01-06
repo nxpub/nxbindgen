@@ -1,3 +1,4 @@
+import re
 import tempfile
 import subprocess
 
@@ -42,6 +43,15 @@ class PythonConverter:
         self._defines = defines or {}
         self._includes = includes or []
 
+    # Specifically for 3.11 version
+    RE_BEGIN_MARKER = re.compile(r'/\* BEWARE!(\s+.*){3}?\*/', re.MULTILINE)
+    RE_END_MARKER = re.compile(r'#if USE_COMPUTED_GOTOS\s+TARGET_DO_TRACING:', re.MULTILINE)
+
+    def crop(self, source: str) -> str:
+        begin_match = self.RE_BEGIN_MARKER.search(source)
+        end_match = self.RE_END_MARKER.search(source)
+        return source[begin_match.span()[1]:end_match.span()[0]]
+
     def apply_fixes(self, fp, header_path: Path) -> None:
         for macro_src, macro_dst in {
             # https://github.com/eliben/pycparser/wiki/FAQ#what-do-i-do-about-__attribute__
@@ -56,7 +66,8 @@ class PythonConverter:
         for macro_src, macro_dst in self._defines.items():
             fp.write(f'#define {macro_src} {macro_dst}'.strip() + '\n')
         with open(header_path) as h_file:
-            for idx, line in enumerate(lines := h_file.readlines()):
+            lines = self.crop(h_file.read()).splitlines()
+            for idx, line in enumerate(lines):
                 clean = line.strip()
                 if not clean:
                     fp.write('//\n')
@@ -64,7 +75,7 @@ class PythonConverter:
                     # https://github.com/eliben/pycparser/issues/484
                     if clean.endswith(':') and lines[idx + 1].strip() == '}':
                         line = f'{line};'
-                    fp.write(line)
+                    fp.write(line + '\n')
         fp.flush()
 
     def load_c(
@@ -81,6 +92,16 @@ class PythonConverter:
         # processed = remove_comments(processed)
         self._ast = CParser().parse(processed, filename=str(path))
 
+    REPLACERS = {
+        r'(\s{0,})env\.stack\.peek\((.*?)\) = (.*)(\s{0,})': r'\1env.stack.poke(\2, \3)\4'
+    }
+
+    def _fix_line(self, line: str) -> Optional[str]:
+        # if line.strip():
+        for src, dst in self.REPLACERS.items():
+            line = re.sub(src, dst, line)
+        return line
+
     def render_py(self, path: Path) -> None:
         generator = PyGenerator(keep_empty_declarations=False, type_hint_declarations=False)
         with open(path, 'w') as py_file:
@@ -93,7 +114,8 @@ class PythonConverter:
                 if line.startswith('def op_NOP('):
                     started = True
                 if started:
-                    py_file.write(line + '\n')
+                    if (line := self._fix_line(line)) is not None:
+                        py_file.write(line + '\n')
 
     def render_c(self, path: Path) -> None:
         generator = CGenerator()
@@ -111,7 +133,7 @@ if __name__ == '__main__':
         defines=config.DEFINES,
     )
     bc.load_c(
-        CPYTHON_PATH / 'Python/generated_cases.c.h',
+        CPYTHON_PATH / 'Python/ceval.c',
         # BINARYEN_PATH / 'test/example/c-api-kitchen-sink.c',
         flags=[
             'Py_BUILD_CORE=1',
